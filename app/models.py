@@ -29,9 +29,14 @@ class Computation(Base):
         nullable=False, index=True,
     )
     plan_revision = Column(Integer, nullable=False)
+    # 计算时的来源方案快照：采用快照完全取自计算记录，
+    # 与方案的后续修订无关，三者（方案、修订、结果）永不混合
+    plan_payload = Column(JSON, nullable=False)
     status = Column(String(16), nullable=False)  # SUCCESS / FAILED
     result = Column(JSON, nullable=True)
     error = Column(JSON, nullable=True)
+    # 历史采用次数：一次成功计算在整个生命周期内至多采用一次（被替换后亦然）
+    adoption_count = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 

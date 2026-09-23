@@ -3,8 +3,13 @@
 事务约定：
 - 方案校验通过后才写库，非法整版不会改写当前方案；
 - 计算失败仅落一条 FAILED 记录，不触碰方案与已采用结果；
-- 采用通过 computation_id 唯一约束保证"一次成功计算只能采用一次"，
-  冲突时回滚并返回稳定错误码，已采用结果保持不变。
+- 计算记录持久化来源方案与来源修订，采用快照完全取自计算记录，
+  与方案的后续修订无关，计算记录、来源方案、来源修订与最小割结果
+  永远组成同一份不可混合的快照；
+- 同一计算在整个生命周期内至多被采用一次（被其他结果替换后亦然），
+  由 computations.adoption_count 判定；同一方案的并发采用通过方案
+  行锁串行化，成功响应与最终落库记录一致，冲突时回滚并返回稳定
+  错误码，当前方案与已采用结果保持不变。
 """
 
 import uuid
@@ -39,7 +44,11 @@ def save_plan(db, plan_id, canonical_payload):
 
 
 def compute(db, plan_id):
-    """对当前方案执行最小割计算并持久化计算记录。"""
+    """对当前方案执行最小割计算并持久化计算记录。
+
+    计算记录携带来源方案快照与来源修订，之后的采用快照完全取自
+    该记录，与方案的后续修订无关。
+    """
     plan = get_plan_or_404(db, plan_id)
     computation_id = uuid.uuid4().hex
     try:
@@ -49,9 +58,11 @@ def compute(db, plan_id):
             computation_id=computation_id,
             plan_id=plan.plan_id,
             plan_revision=plan.revision,
+            plan_payload=plan.payload,
             status="FAILED",
             result=None,
             error={"code": "INTERNAL_ERROR", "message": str(exc)},
+            adoption_count=0,
         )
         db.add(computation)
         db.commit()
@@ -60,9 +71,11 @@ def compute(db, plan_id):
         computation_id=computation_id,
         plan_id=plan.plan_id,
         plan_revision=plan.revision,
+        plan_payload=plan.payload,
         status="SUCCESS",
         result=result,
         error=None,
+        adoption_count=0,
     )
     db.add(computation)
     db.commit()
@@ -82,11 +95,22 @@ def get_computation_or_404(db, plan_id, computation_id):
 
 
 def adopt(db, plan_id, computation_id):
-    """采用一次成功计算，保存方案 + 结果的完整快照。
+    """采用一次成功计算，保存来源方案 + 结果的完整快照。
 
-    同一计算只能被采用一次；新的采用会替换该方案当前的已采用结果。
+    快照完全取自计算记录（来源方案、来源修订、最小割结果），与方案
+    之后的修订无关，三者永远属于同一版本；同一计算在整个生命周期内
+    至多被采用一次，被其他结果替换后仍不可再次采用；新的采用会替换
+    该方案当前的已采用结果。
+
+    同一方案的并发采用通过方案行锁（SELECT ... FOR UPDATE）串行化：
+    锁等待结束后，读提交隔离级别下的后续查询能看到已提交的最新状态，
+    因此并发首次采用不会产生误报冲突或 500，成功响应与最终落库记录
+    一致。
     """
-    plan = get_plan_or_404(db, plan_id)
+    # 行级锁串行化同一方案的并发采用（对不存在的行不加锁，直接 404）
+    plan = db.get(models.Plan, plan_id, with_for_update=True)
+    if plan is None:
+        raise ApiError(404, "PLAN_NOT_FOUND", f"plan {plan_id!r} does not exist")
     computation = get_computation_or_404(db, plan_id, computation_id)
     if computation.status != "SUCCESS":
         raise ApiError(
@@ -94,12 +118,7 @@ def adopt(db, plan_id, computation_id):
             "COMPUTATION_NOT_ADOPTABLE",
             f"computation {computation_id!r} did not succeed",
         )
-    existing = (
-        db.query(models.Adoption)
-        .filter(models.Adoption.computation_id == computation_id)
-        .first()
-    )
-    if existing is not None:
+    if computation.adoption_count > 0:
         raise ApiError(
             409,
             "COMPUTATION_ALREADY_ADOPTED",
@@ -108,11 +127,11 @@ def adopt(db, plan_id, computation_id):
 
     adopted_at = datetime.now(timezone.utc)
     snapshot = {
-        "plan_id": plan.plan_id,
-        "plan_revision": plan.revision,
+        "plan_id": computation.plan_id,
+        "plan_revision": computation.plan_revision,
         "computation_id": computation_id,
         "adopted_at": adopted_at.isoformat(),
-        "plan": plan.payload,
+        "plan": computation.plan_payload,
         "result": computation.result,
     }
     adoption = db.get(models.Adoption, plan_id)
@@ -128,10 +147,11 @@ def adopt(db, plan_id, computation_id):
         adoption.computation_id = computation_id
         adoption.snapshot = snapshot
         adoption.adopted_at = adopted_at
+    computation.adoption_count += 1
     try:
         db.commit()
     except IntegrityError:
-        # 并发下同一计算被重复采用
+        # 行锁下不会到达；兜底保持稳定的错误契约
         db.rollback()
         raise ApiError(
             409,

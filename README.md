@@ -58,10 +58,23 @@ docker compose up --build
 | --- | --- |
 | `PUT /plans/{plan_id}` | 保存（新建或整版替换）方案；非法负载返回 422 且**不改写**当前方案 |
 | `GET /plans/{plan_id}` | 查询当前方案 |
-| `POST /plans/{plan_id}/computations` | 对当前方案计算最小费用隔断，返回计算记录 |
-| `GET /plans/{plan_id}/computations/{computation_id}` | 查询计算记录 |
-| `POST /plans/{plan_id}/adopt` | 采用一次**成功**计算并保存完整快照；同一计算只能采用一次 |
+| `POST /plans/{plan_id}/computations` | 对当前方案计算最小费用隔断，返回计算记录（携带来源方案快照与来源修订） |
+| `GET /plans/{plan_id}/computations/{computation_id}` | 查询计算记录（含历史采用次数 `adoption_count`） |
+| `POST /plans/{plan_id}/adopt` | 采用一次**成功**计算并保存完整快照；同一计算在整个生命周期内只能采用一次（被替换后亦然） |
 | `GET /plans/{plan_id}/adoption` | 查询当前已采用结果（完整快照） |
+
+### 快照一致性
+
+- 计算记录在生成时持久化**来源方案**与**来源修订**；采用快照完全取自
+  计算记录，与方案的后续修订无关——计算记录、来源方案、来源修订与
+  最小割结果永远组成同一份不可混合的快照，快照中的切断清单必然隔断
+  快照方案中的全部污染路径。
+- 每个成功计算至多被采用一次：即使当前采用结果已被另一计算替换，
+  旧计算再次采用仍返回 `409 COMPUTATION_ALREADY_ADOPTED`，历史采用
+  次数（`adoption_count`）恒不超过 1。
+- 同一方案的并发采用按方案行锁串行化：并发首次采用两个不同计算时
+  两者都成功（后提交者替换先提交者），成功响应与最终查询到的采用
+  结果一致；不会把方案记录竞争误报为计算已采用，也不会返回 500。
 
 ### 调用示例
 
@@ -99,13 +112,15 @@ curl -X POST http://localhost:8000/plans/demo/computations
   "plan_id": "demo",
   "plan_revision": 1,
   "status": "SUCCESS",
+  "plan": {"zones": ["..."], "segments": ["..."], "sources": ["SRC1", "SRC2"], "protections": ["SAFE1", "SAFE2"]},
   "result": {"source_zones": ["SRC1", "SRC2"], "cut_segments": ["p1", "p2"], "total_cost": 10},
-  "error": null
+  "error": null,
+  "adoption_count": 0
 }
 ```
 
-采用该计算结果（保存完整快照；同一 `computation_id` 再次采用返回
-`409 COMPUTATION_ALREADY_ADOPTED`）：
+采用该计算结果（保存完整快照；同一 `computation_id` 再次采用——包括被
+其他计算替换之后——返回 `409 COMPUTATION_ALREADY_ADOPTED`）：
 
 ```bash
 curl -X POST http://localhost:8000/plans/demo/adopt \
@@ -157,6 +172,12 @@ pytest
   32 位（直至 2×10¹²）的总费用、自环与提交顺序无关性。
 - `tests/test_api.py`：保存/计算/采用/查询全流程、稳定错误码、非法
   操作不改写既有数据、结果确定性。
+- `tests/test_adoption_consistency.py`：采用快照一致性验收——计算后
+  修订再采用（快照的方案/修订/切断清单/总费用全部来自计算记录）、
+  替换后旧计算不可再次采用（历史采用次数恒为 1）、两个不同计算并发
+  首次采用与同一计算并发采用（响应确定且与最终记录一致）。并发用例
+  需要真实 PostgreSQL 的行级锁，仅在 `TEST_DATABASE_URL` 指向
+  PostgreSQL 时执行。
 
 测试默认使用 SQLite 内存库；设置 `TEST_DATABASE_URL` 可指向 PostgreSQL
 进行对拍。

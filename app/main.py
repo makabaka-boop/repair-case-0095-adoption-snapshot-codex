@@ -94,8 +94,10 @@ def _computation_view(computation):
         "plan_id": computation.plan_id,
         "plan_revision": computation.plan_revision,
         "status": computation.status,
+        "plan": computation.plan_payload,
         "result": computation.result,
         "error": computation.error,
+        "adoption_count": computation.adoption_count,
     }
 
 
