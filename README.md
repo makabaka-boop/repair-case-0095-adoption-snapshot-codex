@@ -60,7 +60,7 @@ docker compose up --build
 | `GET /plans/{plan_id}` | 查询当前方案 |
 | `POST /plans/{plan_id}/computations` | 对当前方案计算最小费用隔断，返回计算记录 |
 | `GET /plans/{plan_id}/computations/{computation_id}` | 查询计算记录 |
-| `POST /plans/{plan_id}/adopt` | 采用一次**成功**计算并保存完整快照；同一计算只能采用一次 |
+| `POST /plans/{plan_id}/adopt` | 采用一次**成功**计算并保存该计算时刻冻结的完整快照；同一计算**至多采用一次**，即使后来被其他计算替换也不可再次采用；并发采用冲突返回 409 |
 | `GET /plans/{plan_id}/adoption` | 查询当前已采用结果（完整快照） |
 
 ### 调用示例
@@ -104,7 +104,8 @@ curl -X POST http://localhost:8000/plans/demo/computations
 }
 ```
 
-采用该计算结果（保存完整快照；同一 `computation_id` 再次采用返回
+采用该计算结果（保存计算时刻冻结的完整快照；同一 `computation_id`
+再次采用——即便其采用结果已被其他计算替换——返回
 `409 COMPUTATION_ALREADY_ADOPTED`）：
 
 ```bash
@@ -136,12 +137,27 @@ curl http://localhost:8000/plans/demo/adoption
 | --- | --- | --- |
 | 400 | `INVALID_JSON` | 请求体不是合法 JSON |
 | 404 | `PLAN_NOT_FOUND` / `COMPUTATION_NOT_FOUND` / `ADOPTION_NOT_FOUND` / `NOT_FOUND` | 资源不存在 |
-| 409 | `COMPUTATION_ALREADY_ADOPTED` / `COMPUTATION_NOT_ADOPTABLE` | 计算已被采用过 / 计算未成功 |
+| 409 | `COMPUTATION_ALREADY_ADOPTED` / `COMPUTATION_NOT_ADOPTABLE` / `ADOPTION_CONFLICT` | 计算已被采用过（含已被替换下来的历史采用）/ 计算未成功 / 并发采用时当前生效结果已被他人改变，请重新查询后再采用 |
 | 422 | `VALIDATION_ERROR` | 负载非法，`details[].code` 给出细分原因（如 `INVALID_ZONE_ID`、`DUPLICATE_SEGMENT_ID`、`UNKNOWN_ZONE`、`INVALID_COST`、`EMPTY_SOURCES`、`SOURCE_PROTECTION_OVERLAP`、`TOO_MANY_ZONES`、`TOO_MANY_SEGMENTS` 等） |
 | 500 | `INTERNAL_ERROR` / `COMPUTATION_FAILED` | 服务内部错误 |
 
 非法整版、计算失败、采用不存在或已采用过的结果，都**不会**改写当前方案
 或已采用结果。
+
+### 快照一致性与并发采用
+
+计算记录在创建时即**冻结**三件同属一个版本的内容：来源方案负载、来源
+修订号 (`plan_revision`) 与最小割结果。采用时快照只取自计算记录，绝不
+读取"当前方案"，因此先计算、再修订方案、再采用旧计算时，快照中的方案、
+修订号、切断管段与总费用仍然彼此匹配，清单也确实隔断的是该版快照中的
+全部污染路径。
+
+每个成功计算至多产生一条不可变的采用历史（`adoption_events`，
+`computation_id` 永久唯一）：它先被采用、再被另一个计算替换后，仍不能
+再次被采用。同一方案上的并发采用由方案行锁串行化：首个采用成功，与其
+并发的首次采用返回 `409 ADOPTION_CONFLICT`（不会出现 500，也不会把行
+竞争误报为"计算已采用"）；成功响应与随后 `GET .../adoption` 查到的最终
+记录逐项一致。
 
 ## 测试
 
@@ -157,6 +173,13 @@ pytest
   32 位（直至 2×10¹²）的总费用、自环与提交顺序无关性。
 - `tests/test_api.py`：保存/计算/采用/查询全流程、稳定错误码、非法
   操作不改写既有数据、结果确定性。
+- `tests/test_snapshot.py`：计算后修订再采用时快照的方案/修订/清单/费用
+  逐项冻结且能隔断快照内污染路径；采用被替换后旧计算不可重用；历史采用
+  次数核对；冲突不改写当前方案与生效快照。
+- `tests/test_concurrency_pg.py`：**仅在真实 PostgreSQL 下运行**
+  （SQLite 自动跳过），确定性地制造两个不同成功计算的并发首次采用，
+  核对一胜（200）一负（409 `ADOPTION_CONFLICT`）、无 500/无误报、
+  成功响应与最终记录一致、历史采用次数为 1，另含多轮并行对拍。
 
 测试默认使用 SQLite 内存库；设置 `TEST_DATABASE_URL` 可指向 PostgreSQL
 进行对拍。
@@ -169,8 +192,8 @@ app/
   flow.py        自实现 64 位整数容量 Dinic 最大流 / 最小割
   validation.py  方案负载域校验（稳定错误码）
   services.py    保存、计算、采用、查询业务逻辑
-  models.py      plans / computations / adoptions 三张表
+  models.py      plans / computations / adoptions / adoption_events 表
   db.py          引擎、会话、建表（带重试）
   errors.py      统一错误信封
-tests/           穷举对拍 + 单元 + 接口测试
+tests/           穷举对拍 + 单元 + 接口 + 快照 + PostgreSQL 并发验收
 ```

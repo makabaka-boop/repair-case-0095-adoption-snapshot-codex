@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 
+from anyio import to_thread
 from fastapi import Depends, FastAPI, Path, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -164,7 +165,10 @@ async def adopt(
                 }
             ],
         )
-    adoption = services.adopt(db, plan_id, computation_id)
+    # services.adopt 是同步的 psycopg2 阻塞事务（内含行锁等待）；
+    # 放到工作线程执行，使并发采用请求能在数据库层真正并行地争锁，
+    # 由行锁串行化后得到确定结果。
+    adoption = await to_thread.run_sync(services.adopt, db, plan_id, computation_id)
     return adoption.snapshot
 
 
